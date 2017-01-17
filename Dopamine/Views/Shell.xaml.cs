@@ -28,6 +28,9 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media.Animation;
+using Microsoft.Win32;
+using System.Security.Principal;
+using System.Management;
 
 namespace Dopamine.Views
 {
@@ -54,11 +57,10 @@ namespace Dopamine.Views
         private bool isMiniPlayerAlwaysOnTop;
         private IEventAggregator eventAggregator;
         private TrayControls trayControls;
-        private Storyboard enableWindowTransparencyStoryboard;
-        private Storyboard disableWindowTransparencyStoryboard;
         private Playlist miniPlayerPlaylist;
         private bool isShuttingDown;
         private bool mustPerformClosingTasks;
+        private ManagementEventWatcher managementEventWatcher;
         #endregion
 
         #region Commands
@@ -96,9 +98,6 @@ namespace Dopamine.Views
 
             // Window
             this.InitializeWindow();
-
-            // Tray icon
-            this.InitializeTrayIcon();
 
             // Services
             this.InitializeServicesAsync();
@@ -186,7 +185,11 @@ namespace Dopamine.Views
             this.ChangePlayerTypeCommand = new DelegateCommand<string>((miniPlayerType) => this.SetPlayer(true, (MiniPlayerType)Convert.ToInt32(miniPlayerType)));
             Common.Prism.ApplicationCommands.ChangePlayerTypeCommand.RegisterCommand(this.ChangePlayerTypeCommand);
 
-            this.TogglePlayerCommand = new DelegateCommand(() => this.TogglePlayer());
+            this.TogglePlayerCommand = new DelegateCommand(() =>
+            {
+                // If tablet mode is enabled, we should not be able to toggle the player.
+                if (!this.IsTabletModeEnabled()) this.TogglePlayer();
+            });
             Common.Prism.ApplicationCommands.TogglePlayerCommand.RegisterCommand(this.TogglePlayerCommand);
 
             // Mini Player
@@ -253,14 +256,15 @@ namespace Dopamine.Views
 
             this.trayIconContextMenu = (ContextMenu)this.FindResource("TrayIconContextMenu");
 
-            if (SettingsClient.Get<bool>("Behaviour", "ShowTrayIcon"))
-            {
-                this.trayIcon.Visible = true;
-            }
+            if (SettingsClient.Get<bool>("Behaviour", "ShowTrayIcon")) this.trayIcon.Visible = true;
         }
 
         private void InitializeWindow()
         {
+            // Start monitoring tablet mode
+            this.StartMonitoringTabletMode();
+
+            // Tray controls
             this.trayControls = this.container.Resolve<Views.TrayControls>();
 
             this.miniPlayerPlaylist = this.container.Resolve<Views.Playlist>(new DependencyOverride(typeof(DopamineWindow), this));
@@ -278,6 +282,71 @@ namespace Dopamine.Views
             // This makes sure the position and size of the window is correct and avoids jumping of 
             // the window to the correct position when SetPlayer() is called later while starting up
             this.SetPlayerType(SettingsClient.Get<bool>("General", "IsMiniPlayer"), (MiniPlayerType)SettingsClient.Get<int>("General", "MiniPlayerType"));
+
+            // Make sure the window geometry respects tablet mode at startup
+            this.CheckIfTabletMode();
+        }
+
+        private void StartMonitoringTabletMode()
+        {
+            try
+            {
+                var currentUser = WindowsIdentity.GetCurrent();
+                if (currentUser != null && currentUser.User != null)
+                {
+                    var wqlEventQuery = new EventQuery(string.Format(@"SELECT * FROM RegistryValueChangeEvent WHERE Hive='HKEY_USERS' AND KeyPath='{0}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ImmersiveShell' AND ValueName='TabletMode'", currentUser.User.Value));
+                    this.managementEventWatcher = new ManagementEventWatcher(wqlEventQuery);
+                    this.managementEventWatcher.EventArrived += this.ManagementEventWatcher_EventArrived;
+                    this.managementEventWatcher.Start();
+                }
+            }
+            catch (Exception ex)
+            {
+                LogClient.Error("Could not start monitoring tablet mode. Exception: {0}", ex.Message);
+            }
+        }
+
+        private void StopMonitoringTabletMode()
+        {
+            try
+            {
+                if (this.managementEventWatcher != null)
+                {
+                    this.managementEventWatcher.Stop();
+                    this.managementEventWatcher.EventArrived -= this.ManagementEventWatcher_EventArrived;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogClient.Error("Could not stop monitoring tablet mode. Exception: {0}", ex.Message);
+            }
+        }
+
+        private bool IsTabletModeEnabled()
+        {
+            int registryTabletMode = 0;
+
+            try
+            {
+                registryTabletMode = (int)Registry.GetValue("HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ImmersiveShell", "TabletMode", 0);
+            }
+            catch (Exception ex)
+            {
+                LogClient.Error("Could not get tablet mode from registry. Exception: {0}", ex.Message);
+            }
+
+            return registryTabletMode == 1 ? true : false;
+        }
+
+        private async void CheckIfTabletMode()
+        {
+            if (this.IsTabletModeEnabled())
+            {
+                // Show the Full Player
+                this.SetPlayer(false, (MiniPlayerType)SettingsClient.Get<int>("General", "MiniPlayerType"));
+                await Task.Delay(50);
+                this.WindowState = WindowState.Maximized;
+            }
         }
 
         private void TogglePlayer()
@@ -305,7 +374,6 @@ namespace Dopamine.Views
             {
                 this.IsMovable = true;
             }
-
         }
 
         private void SetWindowAlwaysOnTop(bool isMiniPlayer)
@@ -570,9 +638,22 @@ namespace Dopamine.Views
         {
             this.trayIconContextMenu.IsOpen = false;
         }
+
+        private void Shell_Loaded(object sender, RoutedEventArgs e)
+        {
+            // This call is not in the constructor, because we want to show the tray icon only
+            // when the main window has been shown by explicitly calling Show(). This prevents 
+            // showing the tray icon when the OOBE window is displayed.
+            this.InitializeTrayIcon();
+        }
         #endregion
 
         #region Event Handlers
+        private void ManagementEventWatcher_EventArrived(object sender, EventArrivedEventArgs e)
+        {
+            Application.Current.Dispatcher.Invoke(() => { this.CheckIfTabletMode(); });
+        }
+
         private void Shell_MouseUp(object sender, MouseButtonEventArgs e)
         {
             this.eventAggregator.GetEvent<ShellMouseUp>().Publish(null);
@@ -784,6 +865,9 @@ namespace Dopamine.Views
 
         private void Shell_Closed(object sender, EventArgs e)
         {
+            // Stop monitoring tablet mode
+            this.StopMonitoringTabletMode();
+
             // Make sure the Tray icon is removed from the tray
             this.trayIcon.Visible = false;
 
